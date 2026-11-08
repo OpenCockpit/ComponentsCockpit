@@ -1,0 +1,534 @@
+import re
+from os.path import join
+
+from enigma import eListbox, eListboxPythonMultiContent, BT_ALIGN_CENTER, iPlayableService, iRecordableService, eServiceReference, iServiceInformation, gFont, RT_HALIGN_LEFT, RT_VALIGN_CENTER, RT_VALIGN_TOP, RT_HALIGN_CENTER, eTimer, getDesktop, eSize, eStreamServer
+import NavigationInstance
+from Screens import Standby  # importing "inStandby" here won't work because it is a boolean so won't update
+from Tools.Directories import resolveFilename, SCOPE_GUISKIN, fileExists
+from Tools.LoadPixmap import LoadPixmap
+from Tools.Hex2strColor import Hex2strColor
+
+from skin import parseScale, applySkinFactor, parseColor, parseFont, parameters
+from Components.Addons.GUIAddon import GUIAddon
+from Components.config import config
+from Components.Label import Label
+from Components.MultiContent import MultiContentEntryPixmapAlphaBlend, MultiContentEntryText
+from Components.ServiceEventTracker import ServiceEventTracker
+from Components.Sources.StreamService import StreamServiceList
+from Components.NimManager import nimmanager
+
+
+# Helpers that only OpenViX provides: openATV gets equivalents here.
+# The fallback imports can't sit next to the imports of the same package above.
+# pylint: disable=ungrouped-imports
+try:
+    from Screens.InfoBarGenerics import hasActiveSubservicesForCurrentChannel
+except ImportError:
+    def hasActiveSubservicesForCurrentChannel(service):
+        try:
+            from Screens.InfoBarGenerics import instanceInfoBarSubserviceSelection
+            info = service and service.info()
+            return bool(instanceInfoBarSubserviceSelection and info and instanceInfoBarSubserviceSelection.hasActiveSubservicesForCurrentService(info.getInfoString(iServiceInformation.sServiceref)))
+        except Exception:  # pylint: disable=broad-except
+            return False
+
+try:
+    from Components.Converter.PliExtraInfo import createCurrentCaidLabel
+except ImportError:
+    from Tools.GetEcmInfo import createCurrentCaidLabel
+
+try:
+    from Components.Converter.ServiceInfo import AUDIO_CHANNEL_LABELS, AUDIO_CODEC_INFO, VIDEO_CODEC_INFO, getCurrentAudioChannels, getCurrentAudioCodec, getCurrentVideoCodec, getVideoHeight
+    from Components.Converter.VAudioInfo import StdAudioDesc
+except ImportError:
+    from Components.Addons.COCServiceInfoCompat import AUDIO_CHANNEL_LABELS, AUDIO_CODEC_INFO, VIDEO_CODEC_INFO, getCurrentAudioChannels, getCurrentAudioCodec, getCurrentVideoCodec, getVideoHeight, StdAudioDesc
+
+try:
+    from Components.OnlineUpdateCheck import versioncheck
+except ImportError:
+    class _NoVersionCheck:
+        @staticmethod
+        def getUnstableUpdateAvailable():
+            return False
+
+        @staticmethod
+        def getStableUpdateAvailable():
+            return False
+
+    versioncheck = _NoVersionCheck()
+# pylint: enable=ungrouped-imports
+
+# iServiceInformation.sHDRType and eServiceReference.getStreamRelay() are OpenViX names (openATV: no HDR type, getIsStreamRelay())
+SERVICE_INFO_HDR_TYPE = getattr(iServiceInformation, "sHDRType", None)
+
+
+def isStreamRelay(service_ref):
+    method = getattr(service_ref, "getStreamRelay", None) or getattr(service_ref, "getIsStreamRelay", None)
+    return bool(method and method())
+
+
+class COCServiceInfoBar(GUIAddon):
+    def __init__(self):
+        GUIAddon.__init__(self)
+        self.nav = NavigationInstance.instance
+        self.nav.record_event.append(self.gotRecordEvent)
+        self.refreshCryptoInfo = eTimer()
+        self.refreshCryptoInfo.callback.append(self.checkCrypto_update)
+        self.refreshAddon = eTimer()
+        self.refreshAddon.callback.append(self.updateAddon)
+        self.elements = []
+        self.skinAttributes = []
+        self.l = eListboxPythonMultiContent()  # noqa: E741
+        self.l.setBuildFunc(self.buildEntry)
+        self.l.setItemHeight(36)
+        self.l.setItemWidth(36)
+        self.spacing = applySkinFactor(10)
+        self.orientations = {"orHorizontal": eListbox.orHorizontal, "orVertical": eListbox.orVertical}
+        self.orientation = eListbox.orHorizontal
+        self.alignment = "left"
+        self.pixmaps = {}
+        self.pixmapsDisabled = {}
+        self.audioCodecIconPath = ""
+        self.audioCodecIconCache = {}
+        self.videoCodecIconPath = ""
+        self.videoCodecIconCache = {}
+        self.audioChannelsIconPath = ""
+        self.audioChannelsIconCache = {}
+        self.separatorLineColor = 0xC0C0C0
+        self.foreColor = 0xFFFFFF
+        self.textBackColor = None
+        self.separatorLineThickness = 0
+        self.autoresizeMode = "auto"  # possible values: auto, fixed, condensed
+        self.font = gFont("Regular", 18)
+        self.__event_tracker = None
+        self.currentCrypto = ""
+        self.tuner_string = ""
+        self.textRenderer = Label("")
+        self.permanentIcons = []
+        self.records_running = 0
+        self.streamServer = eStreamServer.getInstance()
+        self.currentServiceSource = None
+        self.frontendInfoSource = None
+        self.isCryptedDetected = False
+        self.tunerColors = parameters.get("FrontendInfoColors", (0x0000FF00, 0x00FFFF00, 0x007F7F7F))  # tuner active, busy, available colors
+        self.codecIconPrefix = "icon_"  # forced prefix used for video and audio codc icons
+        self.updateStateKey = None
+        self.updateFound = getattr(getattr(config, "softwareupdate", None), "updatefound", None)
+        if self.updateFound:
+            self.updateFound.addNotifier(self.checkUpdateState, initial_call=False, immediate_feedback=True)
+
+    def onContainerShown(self):
+        self.textRenderer.GUIcreate(self.relatedScreen.instance)
+        self.l.setItemHeight(self.instance.size().height())
+        self.l.setItemWidth(self.instance.size().width())
+        self.checkUpdateState(refresh=False)
+        self.updateAddon()
+        if not self.__event_tracker:
+            self.__event_tracker = ServiceEventTracker(
+                screen=self.relatedScreen,
+                eventmap={
+                    iPlayableService.evStart: self.scheduleAddonUpdate,
+                    iPlayableService.evEnd: self.scheduleAddonUpdate,
+                    iPlayableService.evUpdatedInfo: self.scheduleAddonUpdate,
+                    iPlayableService.evVideoSizeChanged: self.updateAddon,
+                    iPlayableService.evHBBTVInfo: self.scheduleAddonUpdate,
+                    iPlayableService.evNewProgramInfo: self.scheduleAddonUpdate,
+                    iPlayableService.evCuesheetChanged: self.scheduleAddonUpdate,
+                    iPlayableService.evTunedIn: self.scheduleAddonUpdate,
+                    iPlayableService.evVideoGammaChanged: self.scheduleAddonUpdate,
+                }
+            )
+        self.currentServiceSource = self.source.screen["CurrentService"]
+        if self.currentServiceSource and self.updateAddon not in self.currentServiceSource.onManualNewService:
+            self.currentServiceSource.onManualNewService.append(self.scheduleAddonUpdate)
+        self.frontendInfoSource = self.source.screen["FrontendInfo"]
+
+    def destroy(self):
+        if self.updateFound:
+            self.updateFound.removeNotifier(self.checkUpdateState)
+        self.nav.record_event.remove(self.gotRecordEvent)
+        self.refreshCryptoInfo.stop()
+        self.refreshAddon.stop()
+        self.refreshCryptoInfo.callback.remove(self.checkCrypto_update)
+        self.refreshAddon.callback.remove(self.updateAddon)
+        GUIAddon.destroy(self)
+
+    GUI_WIDGET = eListbox
+
+    def remove_doubles(self, a_list):
+        duplicate = None
+        for item in a_list:
+            if duplicate != item:
+                duplicate = item
+                yield item
+
+    def gotRecordEvent(self, _service, event):
+        prevRecords = self.records_running
+        if event in (iRecordableService.evEnd, iRecordableService.evStart, None):
+            recs = self.nav.getRecordings()
+            self.records_running = len(recs)
+            if self.records_running != prevRecords:
+                self.updateAddon()
+
+    def scheduleAddonUpdate(self):
+        if hasattr(self, "refreshAddon"):
+            self.refreshAddon.stop()
+            self.refreshAddon.start(200)
+
+    def checkCrypto_update(self):
+        if NavigationInstance.instance is not None:
+            service = NavigationInstance.instance.getCurrentService()
+            info = service and service.info()
+            if info:
+                newCrypto = createCurrentCaidLabel(info)
+                if newCrypto != self.currentCrypto and self.isCryptedDetected:
+                    self.currentCrypto = newCrypto
+                    self.updateAddon()
+
+    def updateAddon(self):
+        self.refreshAddon.stop()
+
+        filteredElements = []
+
+        for x in self.elements:
+            enabledKey = self.detectVisible(x) if x != "separator" else "separator"
+            is_off = isinstance(enabledKey, str) and "_off" in enabledKey
+            if isinstance(enabledKey, str):
+                enabledKey = enabledKey.replace("_off", "")
+            if enabledKey:
+                if not is_off:
+                    filteredElements.append(enabledKey)
+            elif self.autoresizeMode in {"auto", "fixed"} or (x in self.permanentIcons and not is_off):
+                filteredElements.append(x + "!")
+
+        filteredElements = list(self.remove_doubles(filteredElements))
+
+        if filteredElements and filteredElements[-1] == "separator" and len(filteredElements) > 1 and filteredElements[len(filteredElements) - 2] != "currentCrypto":
+            del filteredElements[-1]
+
+        l_list = []
+        l_list.append((filteredElements,))
+        self.l.setList(l_list)
+
+    def detectVisible(self, key):
+        if self.nav is not None:
+            service = self.nav.getCurrentService()
+            pending_service_ref = self.nav.getCurrentServiceReferenceOriginal()
+            pending_sref = pending_service_ref and pending_service_ref.toString() or ""
+            info = service and service.info()
+            isRef = isinstance(service, eServiceReference)
+            # self.current_info = info
+            if not info:
+                return None
+
+            if "%3a//" in pending_sref and pending_service_ref and not isStreamRelay(pending_service_ref):
+                self.isCryptedDetected = False
+
+            video_height = None
+            # video_aspect = None
+            video_height = getVideoHeight(info)
+            if key == "videoRes":
+                if 720 <= video_height < 1500:
+                    return "IS_HD"
+                if video_height >= 1500:
+                    return "IS_4K"
+                return "IS_SD"
+            if key == "txt":
+                tpid = info.getInfo(iServiceInformation.sTXTPID)
+                if 0 < tpid < 100000:
+                    return key
+            elif key == "dolby" and not isRef:
+                audio = service.audioTracks()
+                if audio:
+                    for idx in range(audio.getNumberOfTracks()):
+                        i = audio.getTrackInfo(idx)
+                        description = StdAudioDesc(i.getDescription())
+                        if description and description.split()[0] in {"AC4", "AAC+", "AC3", "AC3+", "Dolby", "DTS", "DTS-HD", "HE-AAC", "IPCM", "LPCM", "WMA Pro"}:
+                            return key
+            elif key == "audioCodec" and not isRef:
+                description = getCurrentAudioCodec(service)
+                icon = AUDIO_CODEC_INFO.get(description, (description, ""))[1]
+                if icon:
+                    return ("dynamicIcon", "audioCodec", f"{self.codecIconPrefix}{icon}")
+            elif key == "audioChannels" and not isRef:
+                channels = getCurrentAudioChannels(service)
+                label = AUDIO_CHANNEL_LABELS.get(channels)
+                if label:
+                    icon = label.replace(".", "-")  # "5.1" -> "5-1", "2.0" -> "2-0"
+                    return ("dynamicIcon", "audioChannels", f"{self.codecIconPrefix}{icon}")
+            elif key == "videoCodec" and not isRef:
+                videoType = getCurrentVideoCodec(info)
+                icon = VIDEO_CODEC_INFO.get(videoType, ("", ""))[1]
+                if icon:
+                    return ("dynamicIcon", "videoCodec", f"{self.codecIconPrefix}{icon}")
+            elif key == "crypt" and not isRef:
+                if "%3a//" in pending_sref and pending_service_ref and not isStreamRelay(pending_service_ref):
+                    return key + "_off"
+                if info.getInfo(iServiceInformation.sIsCrypted) == 1 and info.getInfo(iServiceInformation.sIsSoftCSA) != 1:
+                    self.isCryptedDetected = True
+                    return "IS_CRYPT"
+                if info.getInfo(iServiceInformation.sIsSoftCSA) == 1:
+                    self.isCryptedDetected = True
+                    return "IS_CRYPT_CSA"
+            elif key == "cryptscsa" and not isRef:
+                if "%3a//" in pending_sref and pending_service_ref and not isStreamRelay(pending_service_ref):
+                    return key + "_off"
+                if info.getInfo(iServiceInformation.sIsSoftCSA) == 1:
+                    self.isCryptedDetected = True
+                    return key
+            elif key == "audiotrack" and not isRef:
+                audio = service.audioTracks()
+                if bool(audio) and audio.getNumberOfTracks() > 1:
+                    return key
+            elif key == "subtitletrack" and not isRef:
+                subtitle = service and service.subtitle()
+                subtitlelist = subtitle and subtitle.getSubtitleList()
+                if subtitlelist and len(subtitlelist) > 0:
+                    return key
+            elif key == "hbbtv" and not isRef:
+                if info.getInfoString(iServiceInformation.sHBBTVUrl) != "":
+                    return key
+            elif key == "subservices" and not isRef:
+                if hasActiveSubservicesForCurrentChannel(service):
+                    return key
+            elif key == "stream" and not isRef:
+                if self.streamServer is None:
+                    return None
+                if service.streamed() is not None and (self.streamServer.getConnectedClients() or StreamServiceList):
+                    return key
+            elif key == "currentCrypto":
+                if "%3a//" in pending_sref and pending_service_ref and not isStreamRelay(pending_service_ref):
+                    self.refreshCryptoInfo.stop()
+                    self.currentCrypto = ""
+                    return key + "_off"
+                if not isRef:
+                    self.currentCrypto = createCurrentCaidLabel(info)
+                self.refreshCryptoInfo.start(1000)
+                return key
+            elif key == "record":
+                self.gotRecordEvent(None, None)
+                if self.records_running > 0:
+                    return key
+            elif key == "gamma" and not isRef:
+                hdr = info.getInfo(SERVICE_INFO_HDR_TYPE) if SERVICE_INFO_HDR_TYPE is not None else 0
+                is_hdr = hdr == 3 if hdr > 0 else info.getInfo(iServiceInformation.sGamma) == 1
+                is_hdr10 = hdr == 1 if hdr > 0 else info.getInfo(iServiceInformation.sGamma) == 2
+                is_hlg = hdr == 2 if hdr > 0 else info.getInfo(iServiceInformation.sGamma) == 3
+                if is_hdr:
+                    return "IS_HDR"
+                if is_hdr10:
+                    return "IS_HDR10"
+                if is_hlg:
+                    return "IS_HLG"
+            elif key == "tuners":
+                string = ""
+                if self.frontendInfoSource:
+                    for n in nimmanager.nim_slots:
+                        if n.enabled:
+                            if n.slot == self.frontendInfoSource.slot_number:
+                                color = Hex2strColor(self.tunerColors[0])
+                            elif self.frontendInfoSource.tuner_mask & 1 << n.slot:
+                                color = Hex2strColor(self.tunerColors[1])
+                            else:
+                                continue
+                            if string:
+                                string += " "
+                            string += color + chr(ord("A") + n.slot)
+                    self.tuner_string = string
+                if string:
+                    return key
+            elif key == "catchup":
+                match = re.search(r"catchupdays=(\d*)", pending_sref)
+                if match and int(match.group(1)) > 0:
+                    return key
+            elif key == "servicetype":
+                if "%3a//" in pending_sref.lower() and pending_service_ref and not isStreamRelay(pending_service_ref):
+                    return "iptv"
+                if not isRef:
+                    if self.frontendInfoSource:
+                        tuner_system = self.frontendInfoSource.frontend_type
+                        if tuner_system:
+                            if "DVB-S" in tuner_system:
+                                return "sat"
+                            if "DVB-C" in tuner_system:
+                                return "cable"
+                            if "DVB-T" in tuner_system:
+                                return "terestrial"
+            elif key == "updateStable":
+                if self.updateStateKey == "updateStable":
+                    return key
+            elif key == "updateUnstable":
+                if self.updateStateKey == "updateUnstable":
+                    return key
+
+        return None
+
+    def findDynamicIcon(self, enabledKey):
+        kind, iconName = enabledKey[1:3]
+        if kind == "videoCodec":
+            path, cache = self.videoCodecIconPath, self.videoCodecIconCache
+        elif kind == "audioChannels":
+            path, cache = self.audioChannelsIconPath, self.audioChannelsIconCache
+        else:  # "audioCodec"
+            path, cache = self.audioCodecIconPath, self.audioCodecIconCache
+        if iconName in cache:
+            return cache[iconName]
+        pic = None
+        for extension in (".svg", ".png"):
+            filename = resolveFilename(SCOPE_GUISKIN, join(path, iconName + extension))
+            if fileExists(filename):
+                pic = LoadPixmap(filename)
+                break
+        cache[iconName] = pic
+        return pic
+
+    def buildEntry(self, sequence):
+        xPos = self.instance.size().width() if self.alignment == "right" else 0
+        yPos = 0
+
+        res = [None]
+
+        for x in sequence:
+            enabledKey = x
+            isOn = True
+            if x[-1] == "!":
+                enabledKey = enabledKey.rstrip("!")
+                isOn = False
+
+            pic = None
+            if isOn:
+                if isinstance(enabledKey, tuple) and enabledKey[0] == "dynamicIcon":
+                    pic = self.findDynamicIcon(enabledKey)
+                elif isinstance(enabledKey, str) and enabledKey in self.pixmaps:
+                    pic = LoadPixmap(resolveFilename(SCOPE_GUISKIN, self.pixmaps[enabledKey]))
+            else:
+                if enabledKey == "videoRes":
+                    enabledKey = "IS_HD"
+                if isinstance(enabledKey, str):
+                    if enabledKey in self.pixmaps:
+                        pic = LoadPixmap(resolveFilename(SCOPE_GUISKIN, self.pixmaps[enabledKey]))
+                    if enabledKey in self.pixmapsDisabled:
+                        pic = LoadPixmap(resolveFilename(SCOPE_GUISKIN, self.pixmapsDisabled[enabledKey]))
+
+            if enabledKey not in {"separator", "currentCrypto", "tuners"}:
+                if pic:
+                    pixd_size = pic.size()
+                    pixd_width = pixd_size.width()
+                    pixd_height = pixd_size.height()
+                    pic_x_pos = (xPos - pixd_width) if self.alignment == "right" else xPos
+                    pic_y_pos = yPos + (self.instance.size().height() - pixd_height) // 2
+                    res.append(MultiContentEntryPixmapAlphaBlend(
+                        pos=(pic_x_pos, pic_y_pos),
+                        size=(pixd_width, pixd_height),
+                        png=pic,
+                        backcolor=None, backcolor_sel=None, flags=BT_ALIGN_CENTER))
+                    if self.alignment == "right":
+                        xPos -= pixd_width + self.spacing
+                    else:
+                        xPos += pixd_width + self.spacing
+            elif enabledKey == "separator":
+                res.append(MultiContentEntryText(
+                    pos=(xPos - self.separatorLineThickness, yPos), size=(self.separatorLineThickness, self.instance.size().height()),
+                    font=0, flags=RT_HALIGN_LEFT | RT_VALIGN_CENTER,
+                    text="",
+                    color=self.separatorLineColor, color_sel=self.separatorLineColor,
+                    backcolor=self.separatorLineColor, backcolor_sel=self.separatorLineColor))
+                if self.alignment == "right":
+                    xPos -= self.separatorLineThickness + self.spacing
+                else:
+                    xPos += self.separatorLineThickness + self.spacing
+            else:
+                res_string = ""
+                if enabledKey == "tuners":
+                    res_string = self.tuner_string
+                else:
+                    res_string = self.currentCrypto
+                if res_string:
+                    textWidth = self._calcTextWidth(res_string, font=self.font, size=eSize(self.getDesktopWith() // 3, 0))
+                    res.append(MultiContentEntryText(
+                        pos=(xPos - textWidth - 2, yPos - 2), size=(textWidth + 2, self.instance.size().height()),
+                        font=0, flags=RT_HALIGN_CENTER | RT_VALIGN_TOP,
+                        text=res_string,
+                        color=self.foreColor, color_sel=self.foreColor,
+                        textBWidth=1, textBColor=0x000000,
+                        backcolor=self.textBackColor, backcolor_sel=self.textBackColor))
+                    if self.alignment == "right":
+                        xPos -= textWidth + self.spacing
+                    else:
+                        xPos += textWidth + self.spacing
+        return res
+
+    def checkUpdateState(self, _configElement=None, refresh=True):
+        if versioncheck.getUnstableUpdateAvailable():
+            newKey = "updateUnstable"
+        elif versioncheck.getStableUpdateAvailable():
+            newKey = "updateStable"
+        else:
+            newKey = None
+        if newKey != self.updateStateKey:
+            self.updateStateKey = newKey
+            if refresh and not Standby.inStandby:
+                self.updateAddon()
+
+    def getDesktopWith(self):
+        return getDesktop(0).size().width()
+
+    def _calcTextWidth(self, text, font=None, size=None):
+        if size:
+            self.textRenderer.instance.resize(size)
+        if font:
+            self.textRenderer.instance.setFont(font)
+        self.textRenderer.text = text
+        return self.textRenderer.instance.calculateSize().width()
+
+    def postWidgetCreate(self, instance):
+        instance.setSelectionEnable(False)
+        instance.setContent(self.l)
+        instance.allowNativeKeys(False)
+
+    def applySkin(self, desktop, parent):
+        attribs = []
+        for (attrib, value) in self.skinAttributes[:]:
+            if attrib == "pixmaps":
+                self.pixmaps = dict(item.split(':') for item in value.split(','))
+            elif attrib == "pixmapsDisabled":
+                self.pixmapsDisabled = dict(item.split(':') for item in value.split(','))
+            elif attrib == "audioCodecIconPath":
+                self.audioCodecIconPath = value
+            elif attrib == "videoCodecIconPath":
+                self.videoCodecIconPath = value
+            elif attrib == "audioChannelsIconPath":
+                self.audioChannelsIconPath = value
+            elif attrib == "spacing":
+                self.spacing = parseScale(value)
+            elif attrib == "alignment":
+                self.alignment = value
+            elif attrib == "orientation":
+                self.orientation = self.orientations.get(value, self.orientations["orHorizontal"])
+                if self.orientation == eListbox.orHorizontal:
+                    self.instance.setOrientation(eListbox.orVertical)
+                    self.l.setOrientation(eListbox.orVertical)
+                else:
+                    self.instance.setOrientation(eListbox.orHorizontal)
+                    self.l.setOrientation(eListbox.orHorizontal)
+            elif attrib == "elements":
+                self.elements = value.split(",")
+            elif attrib == "separatorLineColor":
+                self.foreColor = parseColor(value).argb()
+            elif attrib == "separatorLineThickness":
+                self.separatorLineThickness = parseScale(value)
+            elif attrib == "autoresizeMode":
+                self.autoresizeMode = value
+            elif attrib == "font":
+                self.font = parseFont(value, parent.scale)
+            elif attrib == "foregroundColor":
+                self.foreColor = parseColor(value).argb()
+            elif attrib == "textBackColor":
+                self.textBackColor = parseColor(value).argb()
+            elif attrib == "permanent":
+                self.permanentIcons = value.split(",")
+            else:
+                attribs.append((attrib, value))
+        self.skinAttributes = attribs
+        self.l.setFont(0, self.font)
+        return GUIAddon.applySkin(self, desktop, parent)
