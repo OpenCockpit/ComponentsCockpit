@@ -33,11 +33,23 @@ class COCTemplatedMultiContentEx(TemplatedMultiContent):
             eListboxPythonMultiContent, gFont)
 
         from Components.MultiContent import (  # noqa: F401  pylint: disable=possibly-unused-variable
-            MultiContentEntryLinearGradient, MultiContentEntryLinearGradientAlphaBlend,
             MultiContentEntryPixmap, MultiContentEntryPixmapAlphaBlend,
             MultiContentEntryPixmapAlphaTest, MultiContentEntryProgress,
             MultiContentEntryProgressPixmap, MultiContentEntryText,
             MultiContentTemplateColor)
+
+        try:
+            from Components.MultiContent import (  # noqa: F401  pylint: disable=possibly-unused-variable
+                MultiContentEntryPixmapAlphaBlendScaled, MultiContentEntryPixmapAlphaTestScaled)
+        except ImportError:
+            # openATV 6.4 and earlier don't have the Scaled variants; define
+            # them as aliases to the non-scaled variants so skin templates that
+            # use them still work on those versions.
+            MultiContentEntryPixmapAlphaBlendScaled = MultiContentEntryPixmapAlphaBlend
+            MultiContentEntryPixmapAlphaTestScaled = MultiContentEntryPixmapAlphaTest
+
+        from Components.MultiContent import (  # noqa: F401  pylint: disable=possibly-unused-variable
+            MultiContentEntryLinearGradient, MultiContentEntryLinearGradientAlphaBlend)
 
         from skin import parseFont, getSkinFactor  # noqa: F401  pylint: disable=possibly-unused-variable
 
