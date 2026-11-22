@@ -25,9 +25,3 @@ msgstr "Terrestrisch"
 
 msgid "?%s?"
 msgstr "?%s?"
-
-msgid "W"
-msgstr "W"
-
-msgid "E"
-msgstr "O"

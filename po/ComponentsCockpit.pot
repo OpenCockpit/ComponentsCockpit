@@ -25,9 +25,3 @@ msgstr ""
 
 msgid "?%s?"
 msgstr ""
-
-msgid "W"
-msgstr ""
-
-msgid "E"
-msgstr ""
