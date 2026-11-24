@@ -1,5 +1,5 @@
 # ComponentsCockpit (COC)
-Components for Cockpit series plugins
+Skin Components for Cockpit series plugins
 
 ## Limitations
 - Tested on OpenViX and OpenATV with DM900.
