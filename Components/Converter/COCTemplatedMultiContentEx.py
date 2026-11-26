@@ -51,6 +51,12 @@ class COCTemplatedMultiContentEx(TemplatedMultiContent):
         from Components.MultiContent import (  # noqa: F401  pylint: disable=possibly-unused-variable
             MultiContentEntryLinearGradient, MultiContentEntryLinearGradientAlphaBlend)
 
+        try:
+            # a rectangle, with rounded corners if asked for: e.g. the track behind a rounded progress bar
+            from Components.MultiContent import MultiContentEntryRectangle  # noqa: F401  pylint: disable=possibly-unused-variable
+        except ImportError:
+            pass
+
         from skin import parseFont, getSkinFactor  # noqa: F401  pylint: disable=possibly-unused-variable
 
         f = getSkinFactor()  # noqa: F841  pylint: disable=possibly-unused-variable
